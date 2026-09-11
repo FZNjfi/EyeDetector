@@ -5,11 +5,9 @@
 #include <mbedtls/base64.h>
 #include <math.h>
 
-
 // ============================================================
 // CAMERA - AI THINKER ESP32-CAM
 // ============================================================
-
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -62,8 +60,7 @@ struct ControlPacket
 
 
 // ============================================================
-// COMMANDS
-// هماهنگ با ESP8266
+// COMMANDS to ESP8266
 // ============================================================
 
 enum Command : uint8_t
@@ -89,9 +86,6 @@ Command lastCommand = CMD_NONE;
 // MOTOR COMMAND CONTROL
 // ============================================================
 
-// برای FORWARD می‌توانیم فرمان را دوره‌ای بفرستیم.
-// ولی فرمان‌های چرخش فقط یک بار ارسال می‌شوند.
-
 #define FORWARD_COMMAND_INTERVAL 100
 
 unsigned long lastCommandTime = 0;
@@ -101,20 +95,33 @@ unsigned long lastCommandTime = 0;
 // LOST TRACKING
 // ============================================================
 
-#define TRACK_MAX_MISSES 4
+#define TRACK_MAX_MISSES 14
 
 int trackMisses = 0;
 
 
 // ============================================================
+// FLASH ASSIST - PUPIL RECOVERY
+// ============================================================
+
+#define FLASH_GPIO 4
+
+#define FLASH_PULSE_MS 60
+
+#define PUPIL_LOST_BEFORE_FLASH 2
+
+#define FLASH_COOLDOWN_MS 500
+
+int pupilMisses = 0;
+
+unsigned long lastFlashTime = 0;
+
+// ============================================================
 // GAZE CALIBRATION
 // ============================================================
 
-// تعداد نمونه برای کالیبراسیون مرکز
-#define CALIBRATION_SAMPLES 30
+#define CALIBRATION_SAMPLES 0
 
-// محدوده‌ای که بعد از calibration به عنوان مرکز
-// برای حرکت Forward در نظر گرفته می‌شود.
 #define GAZE_CENTER_RANGE 0.10f
 
 bool gazeCalibrated = false;
@@ -129,14 +136,9 @@ float calibratedCenterX = 0.50f;
 // ADAPTIVE CENTER
 // ============================================================
 
-// مرکز را فقط وقتی آرام تغییر می‌دهیم که gaze نزدیک مرکز باشد.
-// این کار باعث می‌شود اگر هدبند/صورت کمی جابه‌جا شد، سیستم
-// دوباره با مرکز جدید سازگار شود.
-
 #define ADAPTIVE_CENTER_ENABLED true
 #define ADAPTIVE_CENTER_ALPHA 0.015f
 
-// حداکثر سرعت تغییر مرکز
 #define CENTER_MIN 0.20f
 #define CENTER_MAX 0.80f
 
@@ -144,20 +146,6 @@ float calibratedCenterX = 0.50f;
 // ============================================================
 // GAZE COMMAND THRESHOLDS
 // ============================================================
-
-// فاصله gaze از مرکز تعیین‌کننده شدت چرخش است.
-//
-// مثال اگر center = 0.35:
-//
-// LEFT_1  : 0.25 تا 0.35
-// LEFT_2  : 0.15 تا 0.25
-// LEFT_3  : کمتر از 0.15
-//
-// RIGHT_1 : 0.35 تا 0.45
-// RIGHT_2 : 0.45 تا 0.55
-// RIGHT_3 : بیشتر از 0.55
-//
-// اما این‌ها بر اساس center محاسبه می‌شوند.
 
 #define TURN_LEVEL_1 0.10f
 #define TURN_LEVEL_2 0.20f
@@ -185,7 +173,7 @@ float calibratedCenterX = 0.50f;
 #define MIN_EYE_AREA 50
 #define MAX_EYE_AREA 1500
 
-#define MIN_EYE_DISTANCE 15
+#define MIN_EYE_DISTANCE 40
 #define MAX_EYE_DISTANCE 190
 
 #define MAX_EYE_DY 10
@@ -210,16 +198,12 @@ float calibratedCenterX = 0.50f;
 #define TEMPLATE_HALF_W 16
 #define TEMPLATE_HALF_H 10
 
-// template فقط بعد از چند فریم معتبر update می‌شود
 #define TEMPLATE_UPDATE_RATE 5
 
 #define MAX_TRACK_ERROR 75.0f
 
-// حداکثر حرکت عمودی tracker
-// این مقدار عمداً سخت‌تر از قبل است.
 #define MAX_TRACK_VERTICAL_JUMP 12
 
-// حداکثر حرکت افقی
 #define MAX_TRACK_HORIZONTAL_JUMP 35
 
 
@@ -299,12 +283,13 @@ struct Pupil
     bool valid;
 
     float confidence;
+
+    char rejectReason[40];
 };
 
 
 Pupil leftPupil;
 Pupil rightPupil;
-
 
 // ============================================================
 // GAZE
@@ -327,6 +312,22 @@ SemaphoreHandle_t rightStartSemaphore;
 SemaphoreHandle_t leftDoneSemaphore;
 SemaphoreHandle_t rightDoneSemaphore;
 
+// ============================================================
+// IRIS GEOMETRY CHECK
+// ============================================================
+
+#define IRIS_RAYS 8
+
+#define IRIS_RADIUS_MIN 7
+#define IRIS_RADIUS_MAX 24
+
+#define IRIS_MIN_BRIGHTNESS_JUMP 15
+
+#define IRIS_MIN_VALID_RAYS 5
+
+#define IRIS_MAX_RADIUS_DEVIATION 0.38f
+
+#define IRIS_MIN_GEOMETRY_SCORE 0.55f
 
 // ============================================================
 // TASK RESULT
@@ -338,7 +339,7 @@ EyeCandidate rightCandidates[12];
 volatile int leftCandidateCount = 0;
 volatile int rightCandidateCount = 0;
 
-
+char pupilRejectReason[40] = "";
 // ============================================================
 // MEMORY
 // ============================================================
@@ -735,30 +736,6 @@ uint8_t blurPixel(int x, int y)
     return sum / count;
 }
 
-
-// ============================================================
-// PREPROCESS
-// ============================================================
-
-void preprocess()
-{
-    for (int y = 1;
-         y < IMG_H - 1;
-         y++)
-    {
-        for (int x = 1;
-             x < IMG_W - 1;
-             x++)
-        {
-            workImage[
-                y * IMG_W + x
-            ] =
-                blurPixel(x, y);
-        }
-    }
-}
-
-
 // ============================================================
 // LOCAL THRESHOLD
 // ============================================================
@@ -991,7 +968,37 @@ EyeCandidate floodFill(
     if (aspect < 0.8f ||
         aspect > 8.0f)
         return result;
+    // Reject very thin horizontal objects
+    // such as eyebrows
+    if (h < 8)
+        return result;
+    
+    int centerY = (minY + maxY) / 2;
 
+    float bandHeight =
+        (float)(EYE_BAND_Y_MAX - EYE_BAND_Y_MIN);
+
+    float relativeBandY =
+        (centerY - EYE_BAND_Y_MIN) / bandHeight;
+
+    bool inEyebrowZone =
+        relativeBandY < 0.32f; 
+
+    bool eyebrowShaped =
+        (aspect > 2.6f) &&
+        ((float)h / w < 0.35f);
+
+    if (inEyebrowZone && eyebrowShaped)
+        return result;
+
+
+    if (aspect > 2.2f && density > 0.55f)
+        return result;
+
+
+    // Reject very wide and thin objects
+    if (aspect > 5.0f && h < 14)
+        return result;
 
     result.x =
         (minX + maxX) / 2;
@@ -1152,7 +1159,20 @@ float pairScore(
 
     int dy =
         abs(r.y - l.y);
+    // ============================================================
+    // REJECT OVERLAPPING EYE BOXES
+    // ============================================================
 
+    int leftBoxRight =
+        l.x + l.w / 2;
+
+    int rightBoxLeft =
+        r.x - r.w / 2;
+
+    if (leftBoxRight >= rightBoxLeft)
+    {
+        return -100000;
+    }
 
     if (dx < MIN_EYE_DISTANCE)
         return -100000;
@@ -1527,27 +1547,16 @@ bool selectBestEyePair(
 // PUPIL DETECTION
 // ============================================================
 
-// سخت‌گیری اصلی برای ابرو:
-//
-// چشم را به این صورت فرض می‌کنیم:
-//
-// ┌───────────────────┐
-// │  ممنوع - ابرو     │
-// │  ممنوع - ابرو     │
-// │                   │
-// │      ● pupil      │
-// │                   │
-// └───────────────────┘
-//
-// بنابراین ناحیه بالایی اصلاً برای مردمک استفاده نمی‌شود.
-
 #define PUPIL_HALF_W 28
 #define PUPIL_TOP_OFFSET 5
 #define PUPIL_BOTTOM_OFFSET 11
 
-#define EYEBROW_REJECT_RATIO 0.22f
+#define SCLERA_MIN_BRIGHTNESS 90.0f
+#define SCLERA_MIN_CONTRAST   45.0f
 
-#define PUPIL_MIN_PIXELS 3
+#define Eyelash_REJECT_RATIO 0.12f
+
+#define PUPIL_MIN_PIXELS 2
 #define PUPIL_MAX_PIXELS 350
 
 #define PUPIL_MIN_DENSITY 0.015f
@@ -1556,7 +1565,208 @@ bool selectBestEyePair(
 #define MAX_PUPIL_JUMP_X 18.0f
 #define MAX_PUPIL_JUMP_Y 8.0f
 
+#define PUPIL_MIN_CIRCULARITY 0.40f
+#define PUPIL_MAX_CIRCULARITY 1.05f
+// ============================================================
+// LIGHTWEIGHT IRIS GEOMETRY CHECK
+// ============================================================
 
+bool checkIrisGeometry(
+    float cx,
+    float cy,
+    float &geometryScore
+)
+{
+    geometryScore = 0.0f;
+
+    if (
+        cx < IRIS_RADIUS_MAX ||
+        cx >= IMG_W - IRIS_RADIUS_MAX ||
+        cy < IRIS_RADIUS_MAX ||
+        cy >= IMG_H - IRIS_RADIUS_MAX
+    )
+    {
+        return false;
+    }
+
+
+    const float angles[IRIS_RAYS] =
+    {
+        0.0f,
+        0.7854f,
+        1.5708f,
+        2.3562f,
+        3.1416f,
+        3.9270f,
+        4.7124f,
+        5.4978f
+    };
+
+
+    int validRays = 0;
+
+    float radiusSum = 0.0f;
+
+    float minRadius = 999.0f;
+    float maxRadius = 0.0f;
+
+
+    for (int i = 0; i < IRIS_RAYS; i++)
+    {
+        float dx =
+            cosf(angles[i]);
+
+        float dy =
+            sinf(angles[i]);
+
+
+        float bestJump = 0.0f;
+        int bestRadius = 0;
+
+        for (
+            int r = IRIS_RADIUS_MIN;
+            r <= IRIS_RADIUS_MAX;
+            r += 2
+        )
+        {
+            int x1 =
+                (int)(cx + dx * r);
+
+            int y1 =
+                (int)(cy + dy * r);
+
+            int x2 =
+                (int)(cx + dx * (r + 2));
+
+            int y2 =
+                (int)(cy + dy * (r + 2));
+
+
+            if (
+                x1 < 1 ||
+                x1 >= IMG_W - 1 ||
+                y1 < 1 ||
+                y1 >= IMG_H - 1 ||
+                x2 < 1 ||
+                x2 >= IMG_W - 1 ||
+                y2 < 1 ||
+                y2 >= IMG_H - 1
+            )
+            {
+                continue;
+            }
+
+
+            int inside =
+                workImage[
+                    y1 * IMG_W + x1
+                ];
+
+
+            int outside =
+                workImage[
+                    y2 * IMG_W + x2
+                ];
+
+
+            float jump =
+                (float)outside -
+                (float)inside;
+
+
+            if (jump > bestJump)
+            {
+                bestJump = jump;
+
+                bestRadius = r;
+            }
+        }
+
+        if (
+            bestRadius > 0 &&
+            bestJump >=
+                IRIS_MIN_BRIGHTNESS_JUMP
+        )
+        {
+            validRays++;
+
+            radiusSum += bestRadius;
+
+
+            if (bestRadius < minRadius)
+                minRadius = bestRadius;
+
+            if (bestRadius > maxRadius)
+                maxRadius = bestRadius;
+        }
+    }
+
+
+    if (
+        validRays <
+        IRIS_MIN_VALID_RAYS
+    )
+    {
+        return false;
+    }
+
+    float meanRadius =
+        radiusSum /
+        validRays;
+
+
+    if (meanRadius <= 0)
+        return false;
+
+    float deviation =
+        (maxRadius - minRadius) /
+        meanRadius;
+
+
+    if (
+        deviation >
+        IRIS_MAX_RADIUS_DEVIATION
+    )
+    {
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // Geometry score
+    // --------------------------------------------------------
+
+    float rayScore =
+        (float)validRays /
+        (float)IRIS_RAYS;
+
+
+    float circleScore =
+        1.0f -
+        deviation /
+        IRIS_MAX_RADIUS_DEVIATION;
+
+
+    if (circleScore < 0)
+        circleScore = 0;
+
+
+    geometryScore =
+        rayScore *
+        circleScore;
+
+
+    if (
+        geometryScore <
+        IRIS_MIN_GEOMETRY_SCORE
+    )
+    {
+        return false;
+    }
+
+
+    return true;
+}
 Pupil findPupil(
     EyeCandidate &eye,
     Pupil &previousPupil
@@ -1564,12 +1774,15 @@ Pupil findPupil(
 {
     Pupil result;
 
+    result.x = -1;
+    result.y = -1;
     result.valid = false;
     result.confidence = 0;
+    strcpy(result.rejectReason, "UNKNOWN");
 
 
     // --------------------------------------------------------
-    // ROI مردمک
+    // ROI Pupil
     // --------------------------------------------------------
 
     int x1 =
@@ -1584,8 +1797,6 @@ Pupil findPupil(
             eye.x + PUPIL_HALF_W
         );
 
-
-    // عمداً قسمت بالایی ROI حذف شده
     int y1 =
         max(
             0,
@@ -1600,27 +1811,24 @@ Pupil findPupil(
 
 
     if (y2 <= y1)
+    {
+        strcpy(result.rejectReason, "BAD_ROI");
         return result;
+    }
 
 
     // --------------------------------------------------------
-    // پیدا کردن تاریک‌ترین مقدار
+    // Darkest Pixel
     // --------------------------------------------------------
 
     int minValue = 255;
 
-    for (int y = y1;
-         y <= y2;
-         y++)
+    for (int y = y1; y <= y2; y++)
     {
-        for (int x = x1;
-             x <= x2;
-             x++)
+        for (int x = x1; x <= x2; x++)
         {
             int v =
-                grayImage[
-                    y * IMG_W + x
-                ];
+                grayImage[y * IMG_W + x];
 
             if (v < minValue)
                 minValue = v;
@@ -1628,9 +1836,11 @@ Pupil findPupil(
     }
 
 
-    // threshold سخت‌تر
-    int threshold =
-        minValue + 22;
+    // --------------------------------------------------------
+    // Threshold
+    // --------------------------------------------------------
+
+    int threshold = minValue + 22;
 
     if (threshold > 85)
         threshold = 85;
@@ -1649,22 +1859,15 @@ Pupil findPupil(
 
 
     // --------------------------------------------------------
-    // پیدا کردن dark pixels
+    // Find dark pixels
     // --------------------------------------------------------
 
-    for (int y = y1;
-         y <= y2;
-         y++)
+    for (int y = y1; y <= y2; y++)
     {
-        for (int x = x1;
-             x <= x2;
-             x++)
+        for (int x = x1; x <= x2; x++)
         {
             int v =
-                grayImage[
-                    y * IMG_W + x
-                ];
-
+                grayImage[y * IMG_W + x];
 
             if (v <= threshold)
             {
@@ -1672,7 +1875,6 @@ Pupil findPupil(
                 sumY += y;
 
                 count++;
-
 
                 if (x < minPX)
                     minPX = x;
@@ -1691,45 +1893,38 @@ Pupil findPupil(
 
 
     // --------------------------------------------------------
-    // تعداد پیکسل
+    // Number of dark pixels
     // --------------------------------------------------------
 
     if (
         count < PUPIL_MIN_PIXELS ||
         count > PUPIL_MAX_PIXELS
     )
-        return result;
+    {
+        snprintf(
+            result.rejectReason,
+            sizeof(result.rejectReason),
+            "COUNT %ld",
+            count
+        );
 
+        return result;
+    }
+
+
+    // --------------------------------------------------------
+    // Pupil center
+    // --------------------------------------------------------
 
     float px =
-        (float)sumX /
-        count;
+        (float)sumX / count;
 
     float py =
-        (float)sumY /
-        count;
+        (float)sumY / count;
 
 
     // --------------------------------------------------------
-    // بررسی اینکه candidate به لبه ROI نچسبیده باشد
-    // --------------------------------------------------------
-
-    if (
-        px < x1 + 3 ||
-        px > x2 - 3
-    )
-        return result;
-
-
-    if (
-        py < y1 + 2 ||
-        py > y2 - 2
-    )
-        return result;
-
-
-    // --------------------------------------------------------
-    // جلوگیری از ابرو
+    // Relative Y
     // --------------------------------------------------------
 
     float relativeY =
@@ -1739,15 +1934,22 @@ Pupil findPupil(
 
     if (
         relativeY <
-        EYEBROW_REJECT_RATIO
+        Eyelash_REJECT_RATIO
     )
     {
+        snprintf(
+            result.rejectReason,
+            sizeof(result.rejectReason),
+            "RELATIVE_Y %.2f",
+            relativeY
+        );
+
         return result;
     }
 
 
     // --------------------------------------------------------
-    // شکل candidate
+    // Candidate shape
     // --------------------------------------------------------
 
     int pw =
@@ -1757,10 +1959,20 @@ Pupil findPupil(
         maxPY - minPY + 1;
 
 
-    if (pw <= 0 ||
-        ph <= 0)
-        return result;
+    if (pw <= 0 || ph <= 0)
+    {
+        strcpy(
+            result.rejectReason,
+            "BAD_SHAPE"
+        );
 
+        return result;
+    }
+
+
+    // --------------------------------------------------------
+    // Density
+    // --------------------------------------------------------
 
     float density =
         (float)count /
@@ -1768,32 +1980,77 @@ Pupil findPupil(
 
 
     if (
-        density <
-            PUPIL_MIN_DENSITY ||
-        density >
-            PUPIL_MAX_DENSITY
+        density < PUPIL_MIN_DENSITY ||
+        density > PUPIL_MAX_DENSITY
     )
     {
-        return result;
-    }
+        snprintf(
+            result.rejectReason,
+            sizeof(result.rejectReason),
+            "DENSITY %.3f",
+            density
+        );
 
-
-    // ابرو معمولاً خیلی کشیده است
-    float aspect =
-        (float)pw / ph;
-
-
-    if (
-        aspect > 3.0f ||
-        aspect < 0.25f
-    )
-    {
         return result;
     }
 
 
     // --------------------------------------------------------
-    // بررسی فاصله با مردمک قبلی
+    // Aspect ratio
+    // --------------------------------------------------------
+
+    float aspect =
+        (float)pw / ph;
+
+
+    if (
+        aspect > 3.4f ||
+        aspect < 0.5f
+    )
+    {
+        snprintf(
+            result.rejectReason,
+            sizeof(result.rejectReason),
+            "ASPECT %.2f",
+            aspect
+        );
+
+        return result;
+    }
+
+
+    // --------------------------------------------------------
+    // Circularity
+    // --------------------------------------------------------
+
+    float expectedEllipseArea =
+        3.14159f *
+        (pw / 2.0f) *
+        (ph / 2.0f);
+
+
+    float circularity =
+        (float)count /
+        expectedEllipseArea;
+
+
+    if (
+        circularity < PUPIL_MIN_CIRCULARITY ||
+        circularity > PUPIL_MAX_CIRCULARITY
+    )
+    {
+        snprintf(
+            result.rejectReason,
+            sizeof(result.rejectReason),
+            "CIRCULARITY %.2f",
+            circularity
+        );
+
+        return result;
+    }
+
+    // --------------------------------------------------------
+    // Pupillary movement
     // --------------------------------------------------------
 
     if (previousPupil.valid)
@@ -1816,45 +2073,38 @@ Pupil findPupil(
             dy > MAX_PUPIL_JUMP_Y
         )
         {
+            snprintf(
+                result.rejectReason,
+                sizeof(result.rejectReason),
+                "JUMP %.1f %.1f",
+                dx,
+                dy
+            );
+
             return result;
         }
     }
 
 
     // --------------------------------------------------------
-    // Confidence
+    // Valid pupil
     // --------------------------------------------------------
-
-    float confidence = 1.0f;
-
-
-    if (relativeY < 0.30f)
-        confidence -= 0.35f;
-
-
-    if (aspect > 2.0f)
-        confidence -= 0.25f;
-
-
-    if (density < 0.03f)
-        confidence -= 0.20f;
-
-
-    if (confidence < 0)
-        confidence = 0;
-
 
     result.x = px;
     result.y = py;
 
-    result.confidence =
-        confidence;
-
     result.valid = true;
+
+    result.confidence = 1.0f;
+
+    strcpy(
+        result.rejectReason,
+        "OK"
+    );
+
 
     return result;
 }
-
 
 // ============================================================
 // GAZE
@@ -2003,8 +2253,6 @@ void updateCalibration(
     if (gazeCalibrated)
         return;
 
-
-    // فقط gaze های معقول
     if (
         gazeX < 0.15f ||
         gazeX > 0.85f
@@ -2065,8 +2313,6 @@ void updateAdaptiveCenter(
             calibratedCenterX
         );
 
-
-    // فقط وقتی gaze نزدیک مرکز است
     if (
         difference <=
         GAZE_CENTER_RANGE
@@ -2109,11 +2355,6 @@ Command getCommand(
         gazeX -
         calibratedCenterX;
 
-
-    // --------------------------------------------------------
-    // نگاه چپ
-    // --------------------------------------------------------
-
     if (diff < 0)
     {
         float amount =
@@ -2151,10 +2392,6 @@ Command getCommand(
         return CMD_LEFT_3;
     }
 
-
-    // --------------------------------------------------------
-    // نگاه راست
-    // --------------------------------------------------------
 
     else
     {
@@ -2253,23 +2490,13 @@ void updateMotorCommand(
     unsigned long now =
         millis();
 
-
-    // --------------------------------------------------------
-    // اگر فرمان چرخش است:
-    //
-    // فقط هنگام تغییر ارسال شود.
-    //
-    // این خیلی مهم است چون ESP8266 بعد از دریافت
-    // LEFT_2 مثلاً خودش حدود 200ms می‌چرخد و STOP می‌کند.
-    // --------------------------------------------------------
-
     if (
         isRotationCommand(command)
     )
     {
-        if (
-            command != lastCommand
-        )
+//        if (
+//            command != lastCommand
+//        )
         {
             sendCommand(
                 command,
@@ -2368,7 +2595,9 @@ void sendImageBase64(
     float ply,
     float prx,
     float pry,
-    const char *cmd
+    const char *cmd,
+    const char *leftReason,
+    const char *rightReason
 )
 {
     static uint8_t *smallImage =
@@ -2516,6 +2745,15 @@ void sendImageBase64(
         prx,
         pry
     );
+    Serial.printf(
+        "PERR_L %s\n",
+        leftReason
+    );
+
+    Serial.printf(
+        "PERR_R %s\n",
+        rightReason
+    );
 
     Serial.printf(
         "GAZE %.3f %.3f\n",
@@ -2652,7 +2890,14 @@ void setup()
         "================================"
     );
 
+    // ========================================================
+    // FLASH INIT
+    // ========================================================
+    ledcSetup(0, 5000, 8);
+    ledcAttachPin(FLASH_GPIO, 0);
 
+    flashOn(0);
+    
     allocateMemory();
 
 
@@ -2661,8 +2906,7 @@ void setup()
         while (1)
             delay(1000);
     }
-
-
+    
     WiFi.mode(
         WIFI_STA
     );
@@ -2758,6 +3002,68 @@ void setup()
     );
 }
 
+// ============================================================
+// FLASH CONTROL
+// ============================================================
+
+void flashOn(uint8_t brightness)
+{
+    ledcWrite(0, brightness);
+
+    Serial.println(">>> FLASH ON - PUPIL RECOVERY <<<");
+}
+
+
+void flashOff()
+{
+    digitalWrite(FLASH_GPIO, LOW);
+
+    Serial.println(">>> FLASH OFF <<<");
+}
+
+
+// ============================================================
+// FLASH RECOVERY
+// ============================================================
+
+void updateFlashRecovery(bool pupilValid)
+{
+    unsigned long now = millis();
+
+    if (pupilValid)
+    {
+        pupilMisses = 0;
+        return;
+    }
+
+    pupilMisses++;
+
+
+    if (
+        pupilMisses <
+        PUPIL_LOST_BEFORE_FLASH
+    )
+    {
+        return;
+    }
+
+
+    if (
+        now - lastFlashTime <
+        FLASH_COOLDOWN_MS
+    )
+    {
+        return;
+    }
+
+
+    lastFlashTime = now;
+
+    pupilMisses = 0;
+
+    flashOn(60);
+}
+
 
 // ============================================================
 // LOOP
@@ -2798,9 +3104,6 @@ void loop()
     // ========================================================
 
     copyFrame(fb);
-
-    preprocess();
-
 
     bool eyesFound = false;
 
@@ -2861,8 +3164,6 @@ void loop()
 
             eyesFound = true;
 
-
-            // calibration از اول شروع می‌شود
             resetCalibration();
 
 
@@ -2976,6 +3277,15 @@ void loop()
             );
 
 
+        // ========================================================
+        // FLASH RECOVERY
+        // ========================================================
+
+        updateFlashRecovery(
+            pupilValid
+        );
+
+
         if (pupilValid)
         {
             // -----------------------------------------------
@@ -3003,7 +3313,6 @@ void loop()
                     gazeX
                 );
 
-
                 command =
                     getCommand(
                         gazeX
@@ -3022,15 +3331,8 @@ void loop()
             CMD_NONE;
     }
 
-
     // ========================================================
     // TEMPLATE UPDATE
-    //
-    // خیلی مهم:
-    //
-    // template فقط وقتی update می‌شود که مردمک معتبر باشد.
-    // بنابراین اگر tracker به ابرو برود، template با ابرو
-    // آلوده نمی‌شود.
     // ========================================================
 
     if (
@@ -3178,7 +3480,9 @@ void loop()
         rightPupil.valid ?
             rightPupil.y : -1,
 
-        commandText(command)
+        commandText(command),
+        leftPupil.rejectReason, 
+        rightPupil.rejectReason
     );
 
 
