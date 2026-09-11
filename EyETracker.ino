@@ -113,8 +113,11 @@ int trackMisses = 0;
 #define FLASH_COOLDOWN_MS 500
 
 int pupilMisses = 0;
+#define MAX_INVALID_PUPIL_FRAMES 3
 
-unsigned long lastFlashTime = 0;
+int leftInvalidPupilFrames = 0;
+int rightInvalidPupilFrames = 0;
+
 
 // ============================================================
 // GAZE CALIBRATION
@@ -188,9 +191,11 @@ float calibratedCenterX = 0.50f;
 // ============================================================
 
 #define TRACK_SEARCH_X 35
-#define TRACK_SEARCH_Y 25
+#define TRACK_SEARCH_Y 12
 
-#define TRACK_STEP 2
+#define TRACK_COARSE_STEP 4
+#define TRACK_FINE_RADIUS 3
+#define TRACK_FINE_STEP 1
 
 #define TEMPLATE_W 32
 #define TEMPLATE_H 20
@@ -209,7 +214,6 @@ float calibratedCenterX = 0.50f;
 
 bool tracking = false;
 int trackFrameCounter = 0;
-
 
 // ============================================================
 // TEMPLATE
@@ -298,7 +302,18 @@ Pupil rightPupil;
 float lastGazeX = 0.5f;
 float lastGazeY = 0.5f;
 
+// ============================================================
+// PARALLEL TRACKING
+// ============================================================
 
+EyeCandidate leftTrackInput;
+EyeCandidate rightTrackInput;
+
+EyeCandidate leftTrackResult;
+EyeCandidate rightTrackResult;
+
+volatile bool leftTrackOK = false;
+volatile bool rightTrackOK = false;
 // ============================================================
 // FREE RTOS
 // ============================================================
@@ -434,15 +449,18 @@ void initializeTemplates()
 // ============================================================
 // TEMPLATE ERROR
 // ============================================================
-
 float templateError(
     int centerX,
     int centerY,
-    uint8_t *templ
+    uint8_t *templ,
+    float cutoff
 )
 {
     long totalError = 0;
     int samples = 0;
+
+    const int TOTAL_SAMPLES =
+        (TEMPLATE_W / 2) * (TEMPLATE_H / 2);
 
     int startX = centerX - TEMPLATE_HALF_W;
     int startY = centerY - TEMPLATE_HALF_H;
@@ -468,23 +486,37 @@ float templateError(
             int reference =
                 templ[y * TEMPLATE_W + x];
 
-            totalError += abs(current - reference);
+            totalError +=
+                abs(current - reference);
 
             samples++;
+
+            // Early exit
+            if (samples > 0)
+            {
+                float currentAverage =
+                    (float)totalError /
+                    (float)TOTAL_SAMPLES;
+
+                if (currentAverage >= cutoff)
+                {
+                    return 999999.0f;
+                }
+            }
         }
     }
 
     if (samples == 0)
         return 999999.0f;
 
-    return (float)totalError / samples;
+    return
+        (float)totalError /
+        (float)samples;
 }
-
 
 // ============================================================
 // TRACK ONE EYE
 // ============================================================
-
 bool trackOneEye(
     EyeCandidate &eye,
     uint8_t *templ
@@ -498,43 +530,65 @@ bool trackOneEye(
     int bestX = oldX;
     int bestY = oldY;
 
+
+    // ========================================================
+    // PHASE 1 - COARSE SEARCH
+    // ========================================================
+
     for (
         int dy = -TRACK_SEARCH_Y;
         dy <= TRACK_SEARCH_Y;
-        dy += TRACK_STEP
+        dy += TRACK_COARSE_STEP
     )
     {
         for (
             int dx = -TRACK_SEARCH_X;
             dx <= TRACK_SEARCH_X;
-            dx += TRACK_STEP
+            dx += TRACK_COARSE_STEP
         )
         {
-            int x = oldX + dx;
-            int y = oldY + dy;
-
-            if (abs(dy) > MAX_TRACK_VERTICAL_JUMP)
+            if (
+                abs(dy) >
+                MAX_TRACK_VERTICAL_JUMP
+            )
                 continue;
 
-            if (abs(dx) > MAX_TRACK_HORIZONTAL_JUMP)
+            if (
+                abs(dx) >
+                MAX_TRACK_HORIZONTAL_JUMP
+            )
                 continue;
 
-            if (x < TEMPLATE_HALF_W ||
-                x >= IMG_W - TEMPLATE_HALF_W)
+
+            int x =
+                oldX + dx;
+
+            int y =
+                oldY + dy;
+
+
+            if (
+                x < TEMPLATE_HALF_W ||
+                x >= IMG_W - TEMPLATE_HALF_W ||
+                y < TEMPLATE_HALF_H ||
+                y >= IMG_H - TEMPLATE_HALF_H
+            )
                 continue;
 
-            if (y < TEMPLATE_HALF_H ||
-                y >= IMG_H - TEMPLATE_HALF_H)
-                continue;
 
             float error =
                 templateError(
                     x,
                     y,
-                    templ
+                    templ,
+                    bestError
                 );
 
-            if (error < bestError)
+
+            if (
+                error <
+                bestError
+            )
             {
                 bestError = error;
 
@@ -544,8 +598,91 @@ bool trackOneEye(
         }
     }
 
-    if (bestError > MAX_TRACK_ERROR)
+
+    // ========================================================
+    // NO GOOD COARSE RESULT
+    // ========================================================
+
+    if (
+        bestError >
+        MAX_TRACK_ERROR
+    )
+    {
         return false;
+    }
+
+
+    // ========================================================
+    // PHASE 2 - FINE SEARCH
+    // ========================================================
+
+    float coarseBestError =
+        bestError;
+
+
+    for (
+        int dy = -TRACK_FINE_RADIUS;
+        dy <= TRACK_FINE_RADIUS;
+        dy += TRACK_FINE_STEP
+    )
+    {
+        for (
+            int dx = -TRACK_FINE_RADIUS;
+            dx <= TRACK_FINE_RADIUS;
+            dx += TRACK_FINE_STEP
+        )
+        {
+            int x =
+                bestX + dx;
+
+            int y =
+                bestY + dy;
+
+
+            if (
+                x < TEMPLATE_HALF_W ||
+                x >= IMG_W - TEMPLATE_HALF_W ||
+                y < TEMPLATE_HALF_H ||
+                y >= IMG_H - TEMPLATE_HALF_H
+            )
+                continue;
+
+
+            float error =
+                templateError(
+                    x,
+                    y,
+                    templ,
+                    bestError
+                );
+
+
+            if (
+                error <
+                bestError
+            )
+            {
+                bestError = error;
+
+                bestX = x;
+                bestY = y;
+            }
+        }
+    }
+
+
+    // ========================================================
+    // FINAL VALIDATION
+    // ========================================================
+
+    if (
+        bestError >
+        MAX_TRACK_ERROR
+    )
+    {
+        return false;
+    }
+
 
     eye.x = bestX;
     eye.y = bestY;
@@ -1256,37 +1393,74 @@ float pairScore(
 // ============================================================
 // TRACK BOTH EYES
 // ============================================================
-
 bool trackEyes()
 {
     if (!templatesInitialized)
         return false;
 
 
-    EyeCandidate newLeft =
+    // ========================================================
+    // COPY INPUT
+    // ========================================================
+
+    leftTrackInput =
         bestLeftEye;
 
-    EyeCandidate newRight =
+    rightTrackInput =
         bestRightEye;
 
 
-    bool leftOK =
-        trackOneEye(
-            newLeft,
-            leftTemplate
-        );
-
-    bool rightOK =
-        trackOneEye(
-            newRight,
-            rightTemplate
-        );
+    leftTrackOK = false;
+    rightTrackOK = false;
 
 
-    if (!leftOK ||
-        !rightOK)
+    // ========================================================
+    // START BOTH CORES
+    // ========================================================
+
+    xSemaphoreGive(
+        leftStartSemaphore
+    );
+
+    xSemaphoreGive(
+        rightStartSemaphore
+    );
+
+
+    // ========================================================
+    // WAIT FOR BOTH
+    // ========================================================
+
+    xSemaphoreTake(
+        leftDoneSemaphore,
+        portMAX_DELAY
+    );
+
+    xSemaphoreTake(
+        rightDoneSemaphore,
+        portMAX_DELAY
+    );
+
+
+    if (
+        !leftTrackOK ||
+        !rightTrackOK
+    )
+    {
         return false;
+    }
 
+
+    EyeCandidate newLeft =
+        leftTrackResult;
+
+    EyeCandidate newRight =
+        rightTrackResult;
+
+
+    // ========================================================
+    // PAIR VALIDATION
+    // ========================================================
 
     int dx =
         newRight.x -
@@ -1299,22 +1473,33 @@ bool trackEyes()
         );
 
 
-    if (dx <
-        MIN_EYE_DISTANCE)
+    if (
+        dx < MIN_EYE_DISTANCE
+    )
         return false;
 
-    if (dx >
-        MAX_EYE_DISTANCE)
+
+    if (
+        dx > MAX_EYE_DISTANCE
+    )
         return false;
 
-    if (dy >
-        MAX_EYE_DY)
+
+    if (
+        dy > MAX_EYE_DY
+    )
         return false;
 
-    if (dx <
-        dy * 3)
+
+    if (
+        dx < dy * 3
+    )
         return false;
 
+
+    // ========================================================
+    // HORIZONTAL CONTINUITY
+    // ========================================================
 
     if (
         abs(
@@ -1336,15 +1521,19 @@ bool trackEyes()
         return false;
 
 
+    // ========================================================
+    // ACCEPT
+    // ========================================================
+
     bestLeftEye =
         newLeft;
 
     bestRightEye =
         newRight;
 
+
     return true;
 }
-
 
 // ============================================================
 // TRACKING FILTER
@@ -2245,6 +2434,94 @@ void resetCalibration()
         0.50f;
 }
 
+// ============================================================
+// TEMPLATE VALIDATION BY PUPIL
+// ============================================================
+
+bool updateTemplateValidity()
+{
+    bool resetTracking = false;
+
+
+    // ========================================================
+    // LEFT PUPIL
+    // ========================================================
+
+    if (leftPupil.valid)
+    {
+        leftInvalidPupilFrames = 0;
+    }
+    else
+    {
+        leftInvalidPupilFrames++;
+
+        if (
+            leftInvalidPupilFrames >=
+            MAX_INVALID_PUPIL_FRAMES
+        )
+        {
+            Serial.println(
+                ">>> LEFT TEMPLATE INVALID <<<"
+            );
+
+            resetTracking = true;
+        }
+    }
+
+
+    // ========================================================
+    // RIGHT PUPIL
+    // ========================================================
+
+    if (rightPupil.valid)
+    {
+        rightInvalidPupilFrames = 0;
+    }
+    else
+    {
+        rightInvalidPupilFrames++;
+
+        if (
+            rightInvalidPupilFrames >=
+            MAX_INVALID_PUPIL_FRAMES
+        )
+        {
+            Serial.println(
+                ">>> RIGHT TEMPLATE INVALID <<<"
+            );
+
+            resetTracking = true;
+        }
+    }
+
+
+    // ========================================================
+    // RESET
+    // ========================================================
+
+    if (resetTracking)
+    {
+        tracking = false;
+
+        templatesInitialized =
+            false;
+
+        filterInitialized =
+            false;
+
+        trackMisses = 0;
+
+        trackFrameCounter = 0;
+
+        leftInvalidPupilFrames = 0;
+        rightInvalidPupilFrames = 0;
+
+        return true;
+    }
+
+
+    return false;
+}
 
 void updateCalibration(
     float gazeX
@@ -2796,7 +3073,26 @@ void leftTask(
             portMAX_DELAY
         );
 
-        detectLeft();
+
+        if (tracking)
+        {
+            EyeCandidate localEye =
+                leftTrackInput;
+
+            leftTrackOK =
+                trackOneEye(
+                    localEye,
+                    leftTemplate
+                );
+
+            leftTrackResult =
+                localEye;
+        }
+        else
+        {
+            detectLeft();
+        }
+
 
         xSemaphoreGive(
             leftDoneSemaphore
@@ -2816,14 +3112,32 @@ void rightTask(
             portMAX_DELAY
         );
 
-        detectRight();
+
+        if (tracking)
+        {
+            EyeCandidate localEye =
+                rightTrackInput;
+
+            rightTrackOK =
+                trackOneEye(
+                    localEye,
+                    rightTemplate
+                );
+
+            rightTrackResult =
+                localEye;
+        }
+        else
+        {
+            detectRight();
+        }
+
 
         xSemaphoreGive(
             rightDoneSemaphore
         );
     }
 }
-
 
 // ============================================================
 // COMMAND TEXT
@@ -3047,23 +3361,10 @@ void updateFlashRecovery(bool pupilValid)
         return;
     }
 
-
-    if (
-        now - lastFlashTime <
-        FLASH_COOLDOWN_MS
-    )
-    {
-        return;
-    }
-
-
-    lastFlashTime = now;
-
     pupilMisses = 0;
 
     flashOn(60);
 }
-
 
 // ============================================================
 // LOOP
@@ -3071,6 +3372,24 @@ void updateFlashRecovery(bool pupilValid)
 
 void loop()
 {
+    // ========================================================
+    // VARIABLES
+    // ========================================================
+
+    bool eyesFound = false;
+    bool pupilValid = false;
+    bool templateReset = false;
+
+    float gazeX = lastGazeX;
+    float gazeY = lastGazeY;
+
+    Command command = CMD_NONE;
+
+
+    // ========================================================
+    // GET FRAME
+    // ========================================================
+
     camera_fb_t *fb =
         esp_camera_fb_get();
 
@@ -3105,10 +3424,6 @@ void loop()
 
     copyFrame(fb);
 
-    bool eyesFound = false;
-
-    bool pupilValid = false;
-
 
     // ========================================================
     // INITIAL DETECTION
@@ -3116,6 +3431,10 @@ void loop()
 
     if (!tracking)
     {
+        // ----------------------------------------------------
+        // Ask left/right tasks to perform full eye detection
+        // ----------------------------------------------------
+
         xSemaphoreGive(
             leftStartSemaphore
         );
@@ -3124,6 +3443,10 @@ void loop()
             rightStartSemaphore
         );
 
+
+        // ----------------------------------------------------
+        // Wait for both eyes
+        // ----------------------------------------------------
 
         xSemaphoreTake(
             leftDoneSemaphore,
@@ -3136,6 +3459,10 @@ void loop()
         );
 
 
+        // ----------------------------------------------------
+        // Select valid left/right eye pair
+        // ----------------------------------------------------
+
         bool found =
             selectBestEyePair(
                 false
@@ -3144,6 +3471,10 @@ void loop()
 
         if (found)
         {
+            // ------------------------------------------------
+            // New eye lock
+            // ------------------------------------------------
+
             filterInitialized =
                 false;
 
@@ -3154,17 +3485,31 @@ void loop()
             initializeTemplates();
 
 
-            tracking = true;
+            tracking =
+                true;
 
 
-            trackMisses = 0;
+            trackMisses =
+                0;
 
-            trackFrameCounter = 0;
+
+            trackFrameCounter =
+                0;
 
 
-            eyesFound = true;
+            eyesFound =
+                true;
+
 
             resetCalibration();
+
+
+            // Reset invalid-pupil counters
+            leftInvalidPupilFrames =
+                0;
+
+            rightInvalidPupilFrames =
+                0;
 
 
             Serial.println(
@@ -3186,20 +3531,34 @@ void loop()
 
         if (tracked)
         {
-            trackMisses = 0;
+            // ------------------------------------------------
+            // Tracking successful
+            // ------------------------------------------------
+
+            trackMisses =
+                0;
+
 
             updateTrackingFilter();
 
 
-            eyesFound = true;
+            eyesFound =
+                true;
+
 
             trackFrameCounter++;
         }
         else
         {
+            // ------------------------------------------------
+            // Tracking failed
+            // ------------------------------------------------
+
             trackMisses++;
 
-            eyesFound = false;
+
+            eyesFound =
+                false;
 
 
             Serial.printf(
@@ -3208,6 +3567,10 @@ void loop()
                 TRACK_MAX_MISSES
             );
 
+
+            // ------------------------------------------------
+            // Too many tracking failures
+            // ------------------------------------------------
 
             if (
                 trackMisses >=
@@ -3229,47 +3592,55 @@ void loop()
                 lastCommand =
                     CMD_NONE;
 
+
                 lastCommandTime =
                     millis();
 
 
-                tracking = false;
+                tracking =
+                    false;
+
 
                 templatesInitialized =
                     false;
+
 
                 filterInitialized =
                     false;
 
 
-                trackMisses = 0;
+                trackMisses =
+                    0;
 
-                trackFrameCounter = 0;
+
+                trackFrameCounter =
+                    0;
 
 
                 resetCalibration();
+
+
+                // Reset pupil invalid counters
+                leftInvalidPupilFrames =
+                    0;
+
+                rightInvalidPupilFrames =
+                    0;
             }
         }
     }
 
 
     // ========================================================
-    // GAZE
+    // GAZE / PUPIL
     // ========================================================
-
-    float gazeX =
-        lastGazeX;
-
-    float gazeY =
-        lastGazeY;
-
-
-    Command command =
-        CMD_NONE;
-
 
     if (eyesFound)
     {
+        // ----------------------------------------------------
+        // Calculate pupil + gaze
+        // ----------------------------------------------------
+
         pupilValid =
             calculateGaze(
                 gazeX,
@@ -3277,20 +3648,66 @@ void loop()
             );
 
 
-        // ========================================================
-        // FLASH RECOVERY
-        // ========================================================
+        // ----------------------------------------------------
+        // Check repeated invalid pupil
+        //
+        // If one eye is invalid for 3 consecutive frames:
+        // tracking + templates are completely reset.
+        // ----------------------------------------------------
 
-        updateFlashRecovery(
-            pupilValid
-        );
+        templateReset =
+            updateTemplateValidity();
 
 
-        if (pupilValid)
+        // ----------------------------------------------------
+        // If template tracking became invalid, abandon
+        // this frame and return to full eye detection.
+        // ----------------------------------------------------
+
+        if (templateReset)
         {
-            // -----------------------------------------------
+            eyesFound =
+                false;
+
+
+            pupilValid =
+                false;
+
+
+            command =
+                CMD_NONE;
+
+
+            Serial.println(
+                ">>> PUPIL INVALID 3 FRAMES - RESET TRACKING <<<"
+            );
+        }
+
+
+        // ====================================================
+        // FLASH RECOVERY
+        // ====================================================
+
+        if (!templateReset)
+        {
+            updateFlashRecovery(
+                pupilValid
+            );
+        }
+
+
+        // ====================================================
+        // NORMAL GAZE PROCESSING
+        // ====================================================
+
+        if (
+            !templateReset &&
+            pupilValid
+        )
+        {
+            // ------------------------------------------------
             // Calibration
-            // -----------------------------------------------
+            // ------------------------------------------------
 
             if (!gazeCalibrated)
             {
@@ -3298,20 +3715,22 @@ void loop()
                     gazeX
                 );
 
+
                 command =
                     CMD_NONE;
             }
 
 
-            // -----------------------------------------------
+            // ------------------------------------------------
             // Normal operation
-            // -----------------------------------------------
+            // ------------------------------------------------
 
             else
             {
                 updateAdaptiveCenter(
                     gazeX
                 );
+
 
                 command =
                     getCommand(
@@ -3331,6 +3750,7 @@ void loop()
             CMD_NONE;
     }
 
+
     // ========================================================
     // TEMPLATE UPDATE
     // ========================================================
@@ -3338,7 +3758,9 @@ void loop()
     if (
         eyesFound &&
         pupilValid &&
-        gazeCalibrated
+        gazeCalibrated &&
+        !templateReset &&
+        templatesInitialized
     )
     {
         if (
@@ -3430,6 +3852,7 @@ void loop()
                 " | PUPIL INVALID"
             );
 
+
             Serial.print(
                 " | CMD STOP"
             );
@@ -3481,7 +3904,9 @@ void loop()
             rightPupil.y : -1,
 
         commandText(command),
-        leftPupil.rejectReason, 
+
+        leftPupil.rejectReason,
+
         rightPupil.rejectReason
     );
 
@@ -3490,7 +3915,9 @@ void loop()
     // RETURN FRAME
     // ========================================================
 
-    esp_camera_fb_return(fb);
+    esp_camera_fb_return(
+        fb
+    );
 
 
     delay(5);
